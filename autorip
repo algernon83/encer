@@ -1,0 +1,275 @@
+#!/bin/bash
+function usage {
+  echo '
+
+'
+}
+
+function cleanup {
+#  rm $pidPath
+echo
+}
+
+function encode {
+  # Determine # of audio and subtitle tracks
+  numLines=0
+  numAudio=0
+  numSubtitle=0
+
+  echo Encoding \"$1\"\ to \"$2\".
+
+  while read line
+  do
+    ((numLines += 1))
+    if grep -q "+ subtitle tracks:" <<< "$line"; then
+     ((numAudio=$numLines - 2))
+    fi
+  done < <(HandBrakeCLI --scan -i "$1" 2>&1 > /dev/null | grep -A 9999 -e "  + audio tracks:") > /dev/null
+  ((numSubtitle=$numLines - $numAudio - 4))
+
+  # Output first track downsampled to aac, then copy all tracks
+  audio=copy:ac3
+  for i in `seq $numAudio`; do audio=${audio},copy; done;
+
+  mkdir -p "`dirname "$2"`"
+  HandBrakeCLI -i "$1" -o "$2.part" -f mkv -e x264 -a "1,`seq -s ',' ${numAudio}`" -E "$audio" -s "`seq -s ',' ${numSubtitle}`" -m --x264-tune film --x264-profile high -q 23 --cfr -U -d -5 -P --encoder-preset ultrafast --crop 0:0:0:0 --strict-anamorphic > /dev/null 2>&1 && mv "$2.part" "$2"
+#  HandBrakeCLI -i "$1" -o "$2.part" -f mkv -e x264 -a "1,`seq -s ',' ${numAudio}`" -E "$audio" -s "`seq -s ',' ${numSubtitle}`" -m --x264-tune film --x264-profile high -q 23 --cfr -U -d -5 -P --encoder-preset ultrafast --crop 0:0:0:0 --strict-anamorphic > /dev/null 2>&1 && mv "$2.part" "$2"
+#echo  HandBrakeCLI -i "$1" -o "$2.part" -f mkv -e x264 -a "1,`seq -s ',' ${numAudio}`" -E "$audio" -s "`seq -s ',' ${numSubtitle}`" -m --x264-tune film --x264-profile high -q 23 --cfr -U -d -5 -P --encoder-preset ultrafast --crop 0:0:0:0 --strict-anamorphic
+}
+
+function encodeFolder {
+  inFolder=$1
+  outFolder=$2
+  skip=$3
+  [ "" != "$4" ] && recursive=true||recursive=false
+
+  isGrowing "$inFolder" && { echo "Input path \"$inFolder\" is in use."; cleanup; exit; }
+
+  for inFile in "$inFolder/"*.[am][vk4][vi]; do
+    if [ "$inFile" != "$inFolder/$skip" ]; then
+      (encodeToFolder "$inFile" "$outFolder")
+    fi
+  done
+  for inFile in "$inFolder/"*.mpg; do
+    if [ "$inFile" != "$inFolder/$skip" ]; then
+      (encodeToFolder "$inFile" "$outFolder")
+    fi
+  done
+
+  if $recursive; then
+    for dir in "$inFolder/"*; do
+      if [ -d "$dir" ] && [ "$dir" != "." ] && [ "$dir" != ".." ]; then
+        encodeFolder "$dir" "${outFolder}/$(basename "$dir")" "" true
+      fi
+    done
+  fi
+}
+
+function encodeToFolder {
+  inFile=$1
+  outFolder=$2
+  baseName=$(basename "$inFile")
+  outFile=$outFolder/${baseName%.*}.mkv
+  if [ ! -e  "$outFile" ]; then
+    encode "$inFile" "$outFile"
+  fi
+}
+
+function encodeMovies {
+  inFolder=$1
+  outFolder=$2
+  extrasFolder=$3
+  for title in "$inFolder"/*; do
+    title=`basename "$title"`
+    if [ -d "$inFolder/$title" ]; then
+      (encodeMovie "$inFolder" "$outFolder" "$extrasFolder" "$title")
+    fi
+  done
+}
+
+function encodeMovie {
+  inFolder=$1
+  outFolder=$2
+  extrasFolder=$3
+  title=$4
+  isGrowing "$inFolder" && { echo "Input path \"$inFolder\" is in use."; cleanup; exit; }
+
+  # Assume largest file is title and rest are extras
+  originalMovieFile=`ls -S "$inFolder/$title/" | head -n 1`
+  movieFile=$title.${originalMovieFile##*.}
+  if [ "$originalMovieFile" != "$movieFile" ]; then
+    mv "$inFolder/$title/$originalMovieFile" "$inFolder/$title/$movieFile"
+  fi
+  encodeToFolder "${inFolder}/$title/${movieFile}" "$outFolder/$title"
+  encodeFolder "$inFolder/$title" "$extrasFolder/$title" "$movieFile"
+}
+
+function processTVSeasonDisc {
+  seasonInFolder=$1
+  season=$2
+  title=$3
+  readingEpisodes=true
+  unset episodes
+  unset extras
+
+  # If the folder has 1 or 0 files, there's nothing we can do.
+echo checking $seasonInFolder
+  if (($(ls "$seasonInFolder" | wc -l) < 2)); then
+    continue
+  fi
+  isGrowing "$seasonInFolder" && { echo "Input path \"$seasonInFolder\" is in use."; cleanup; exit; }
+
+  for fileName in "$seasonInFolder"/*.[am][vk4][iv]; do
+    [ -w "$fileName" ] || return
+  done
+
+  {
+    read fileName
+echo file is $fileName
+    lastSizeBytes=$(stat -c%s "$fileName")
+    episodes[0]=$fileName
+
+    while read fileName; do
+      sizeBytes=$(stat -c%s "$fileName")
+      sizeRatio=$((((sizeBytes * 100) / lastSizeBytes)))
+      if $readingEpisodes && ((sizeRatio >= 53)); then
+        episodes=("${episodes[@]}" "$fileName")
+      else
+        readingEpisodes=false
+        extras=("${extras[@]}" "$fileName")
+      fi
+      lastSizeBytes=$sizeBytes
+    done
+  }< <(ls -S "$seasonInFolder"/*.m[k4]v)
+
+  # If an episode is > 1.5GB, we're looking at a Blu-Ray, so the episodes are in reverse order.
+#  (( 1500000000 <= $(stat -c%s "${episodes[0]}") )) && order=-r
+#  IFS=$'\n' episodes=($(sort $order <<<"${episodes[*]}"))
+  IFS=$'\n' episodes=($(sort <<<"${episodes[*]}"))
+  IFS=$'\n' extras=($(sort <<<"${extras[*]}"))
+
+  # Name episode files appropriately and move to season folder
+  shopt -u nullglob; j=$((`ls "$seasonInFolder/.."/*.m[k4]v 2>/dev/null | wc -l`+1)); shopt -s nullglob
+  for i in `seq 0 $((${#episodes[@]}-1))`; do
+    mv "${episodes[$i]}" "$seasonInFolder/../$title S$(printf "%02d" $season)E$(printf "%02d" $j).${episodes[i]##*.}"
+    j=$((j+1))
+  done
+
+  # Same for extra features, which go into Season 99
+  extrasFolder="$seasonInFolder/../../Season 99"
+  mkdir -p "$extrasFolder"
+  shopt -u nullglob; j=$((`ls "$extrasFolder/$title S99 - Extra Features S$(printf "%02d" $season) - "*.m[k4]v 2>/dev/null | wc -l`+1)); shopt -s nullglob
+  for i in `seq 0 $((${#extras[@]}-1))`; do
+    mv "${extras[$i]}" "$extrasFolder/$title S99E$(printf "%02d" $j) - Extra Features S$(printf "%02d" $season)"
+    j=$((j+1))
+  done
+}
+
+function encodeTVSeason {
+  seasonInFolder=$1
+  seasonOutFolder=$2
+  season=$3
+  title=$4
+
+  # Read through all subfolders (assumed to be separate discs) and name files appropriately
+  for folder in "$seasonInFolder"/*; do
+    if [ -d "$folder" ]; then
+      (processTVSeasonDisc "$folder" "$season" "$title")
+    fi
+  done
+
+  # Encode files from this folder
+  encodeFolder "$seasonInFolder" "$seasonOutFolder"
+}
+
+function encodeTVShow {
+  inFolder=$1
+  outFolder=$2
+  title=$(basename "$inFolder")
+
+  for dir in "$inFolder/"*; do
+    if [ -d "$dir" ]; then
+      read foo season < <((basename "$dir"))
+      season=$((season))
+      (encodeTVSeason "$dir" "$outFolder/$title/Season $(printf "%02d" $season)" "$season" "$title")
+    fi
+  done
+}
+
+function encodeTV {
+  inFolder=$1
+  outFolder=$2
+  for dir in "$inFolder/"*; do
+    if [ -d "$dir" ]; then
+      (encodeTVShow "$dir" "$outFolder")
+    fi
+  done
+}
+
+function isGrowing {
+  temp1=$(mktemp)
+  temp2=$(mktemp)
+
+  dir=$1
+  find "${dir}" -type f -printf "%b\n" > "${temp1}"
+  sleep 4
+  find "${dir}" -type f -printf "%b\n" > "${temp2}"
+  diff -q "${temp1}" "${temp2}" > /dev/null && retval=1 || retval=0
+  rm "${temp1}"
+  rm "${temp2}"
+  return $retval
+}
+
+function ripAll {
+  while read content inPath outPath extrasFolder recursive; do
+    echo autorip $content $inPath $outPath $extrasFolder $recursive 1>&2
+    (autorip "$content" "$inPath" "$outPath" "$extrasFolder" $recursive)
+  done < <(grep -v '^[[:space:]]*#' /etc/autorip.cfg)
+}
+
+
+# Main function
+function autorip {
+  content=$1
+  inPath=$2
+  outPath=$3
+  [ "" != "$4" ] && extrasFolder=$4 || extrasFolder=${outPath}/../Movie\ Extras
+  recursive=$5
+
+  [ "" != "$content" ] || { echo "Content type not specified."; cleanup; exit; }
+  [ "" != "$inPath" ] || { echo "Input not specified."; cleanup; exit; }
+  [ -e "$inPath" ] || { echo "Input \"$inPath\" not found."; cleanup; exit; }
+  [ "$outPath" != "" ] || { echo "Output not specified."; cleanup; exit; }
+
+  if [ -d "$inPath" ]; then
+    case "$content" in
+      tv)encodeTV "$inPath" "$outPath";;
+      movies)encodeMovies "$inPath" "$outPath" "$extrasFolder";;
+      folder)encodeFolder "$inPath" "$outPath" "" $recursive;;
+      *)echo Unrecognized content type\: $content; cleanup; exit;;
+    esac
+  fi
+}
+
+shopt -s nullglob
+
+auto=false
+recursive=false
+while getopts c:i:o:e:ar o; do
+  case "$o" in
+    c)  content=$OPTARG;;
+    i)  inPath=$OPTARG;;
+    o)  outPath=$OPTARG;;
+    e)  extrasFolder=$OPTARG;;
+    a)  auto=true;;
+    r)  recursive=true;;
+  esac
+done
+
+if $auto; then
+  [ "2" == "$(ps -C autorip -o pid= | wc -l)" ] || { echo autorip in progress. Aborting.>&2; exit; }
+  ripAll
+else
+  (autorip "$content" "$inPath" "$outPath" "$extrasFolder" $recursive)
+fi
+cleanup
